@@ -5,7 +5,11 @@ Interact with Berkeleytime using an AI agent! Ask Claude Code things like:
 - "easiest open Arts & Literature classes with seats, ranked by estimated workload"
 - "american cultures classes that aren't on Mondays from 4PM to 5PM"
 - "music department classes with the highest GPA that fulfill any breadth, with non-reserved open seats"
-- "which breadths does espm 50ac fulfill"
+- "which breadths does espm 50ac fulfill" (this one could take a minute)
+
+*It is suggested to run the skill with Claude in **auto** mode*
+
+Experiment with what you can do! Not everything is documented in the repo, but the agent can use introspection to determine if it's possible.
 
 This skill gives Claude fine-grained, bulk access to the [Berkeleytime](https://berkeleytime.com) course catalog. **This project is not affiliated with Berkeleytime**.
 
@@ -55,14 +59,8 @@ Output formats: `--format table` (default), `md`, `csv`, `json`.
 Columns via `--fields`: `grade, code, title, open, cap, units, workload,
 difficulty, usefulness, recommended, sections, meet`.
 
-## Layout
-
-| Path | What it is |
-|---|---|
-| `SKILL.md` | The instructions Claude loads — frontmatter, workflow, recipes. |
-| `scripts/bt.py` | The tool. Handles pagination, section dedup, cross-list collapse, ratings flattening, table output. |
-| `references/schema.md` | Documented API surface: filters, enums, all 12 breadths, result fields, introspection fallback. |
-| `install.sh` | Copies the skill into a skills directory. |
+## Disclaimer
+Using the skill isn't perfect and should be checked on Berkeley's official course catalog.
 
 ## License
 
