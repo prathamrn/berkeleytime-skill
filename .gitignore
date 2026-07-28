@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# Local scratch (ad-hoc GraphQL queries, exported tables)
+*.local.*
+scratch/
+out/
+*.csv
+!references/*.csv
