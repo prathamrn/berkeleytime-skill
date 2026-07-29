@@ -18,16 +18,23 @@ catalogSearch(
 ) { totalCount, results { … } }
 ```
 
-`totalCount` is authoritative. The Berkeleytime **UI** pages at 25/results; the
-API accepts a large `pageSize` (100+ works) so one request per filter is usually
-enough — the script still loops pages until a short page to be safe.
+`totalCount` is authoritative. **The server hard-caps `pageSize` at 100 no
+matter what you request** (verified: `pageSize: 150` and `pageSize: 200` both
+silently return exactly 100 rows for page 1) — the Berkeleytime UI just pages
+at 25. `bt.py search` handles this correctly: `fetch_all()` loops pages using
+`totalCount` as the stopping condition, not "got fewer rows than asked for"
+(that comparison would falsely declare page 1 the last page whenever
+`--page-size` is set above the real cap). If you hand-roll a `raw` query with
+your own pagination, loop the same way.
 
 ### result fields (per class section)
 `year, semester, sessionId, subject, courseNumber, number, title, unitsMin,
 unitsMax, courseTitle, allTimeAverageGrade, allTimePassCount, allTimeNoPassCount,
 enrolledCount, maxEnroll, activeReservedMaxCount,
+waitlistedCount, maxWaitlist, enrollmentStatus, primaryOnline,
 aggregatedRatings { metrics { metricName count weightedAverage } },
-decal { title }, meetings { days startTime endTime }`
+decal { title },
+meetings { days startTime endTime location instructors { givenName familyName } }`
 
 - `allTimeAverageGrade` — all-time average GPA (best proxy for A-rate; `null` for
   courses with no grade history / new offerings).
@@ -37,6 +44,20 @@ decal { title }, meetings { days startTime endTime }`
   `[Mon,Tue,Wed,Thu,Fri,Sat,Sun]` (verified: MWF classes = `[T,F,T,F,T,F,F]`).
 - Ratings come back **inline** here — no per-class call needed for
   Workload/Difficulty/Usefulness/Recommended.
+- **`meetings.instructors` and `meetings.location`** — undocumented in the
+  public API surface but present on `CatalogMeeting` (found via
+  `introspect --type CatalogMeeting`) and wired into `bt.py search` as it now
+  requests them by default. This is the only way to get instructors **in
+  bulk** (one call, any term/department/search-text combo) — `bt.py details`
+  only gets you one class at a time. Use `search --instructor "Name"` (local
+  substring filter, case-insensitive — matches first *or* last name, so
+  `"Hug"` also matches `"Hughes"`) with `--fields instructor,code,title,meet,location`.
+  No server-side instructor filter exists; the script fetches the whole
+  term/department and filters client-side.
+- `waitlistedCount`/`maxWaitlist` and `enrollmentStatus` (e.g. `"O"` open /
+  `"C"` closed / `"W"` waitlist) are also on `CatalogClass` and wired into
+  `search --fields waitlist,status`. `primaryOnline` → `--fields online`
+  (`Yes`/`No`/`Mixed` when sections disagree).
 
 ## CatalogFilters (input)
 
@@ -109,10 +130,25 @@ entries are university requirements surfaced as breadth options.)
   aggregatedRatings{…} gradeDistribution{…} }` and
   `primarySection { component enrollment{ latest{ enrolledCount maxEnroll
   waitlistedCount maxWaitlist } } exams{…} meetings{ days location startTime
-  endTime instructors{ familyName givenName } } }`.
+  endTime instructors{ familyName givenName } } }` — `instructors` here is the
+  `Instructor` type (`{ givenName familyName }`), the single-class sibling of
+  `CatalogInstructor` used in bulk `catalogSearch` results (same shape, two
+  names because `class(...)` and `catalogSearch(...)` return parallel type
+  trees — `Class`/`Section`/`Meeting`/`Instructor` vs.
+  `CatalogClass`/`CatalogSection`/`CatalogMeeting`/`CatalogInstructor`).
+  `primarySection` is the lecture; `class(...).sections` is discussions/labs
+  and their `meetings.instructors` usually comes back empty (GSIs aren't
+  populated the same way) — query `primarySection` for the instructor of record.
 
-Key scalar types: `sessionId: SessionIdentifier!` (usually `"1"`),
-`courseNumber: CourseNumber!` (e.g. `"61C"`), `number: ClassNumber!` (section, e.g. `"001"`).
+Key scalar types for `raw`/hand-written queries against `class(...)` or
+`section(...)`: `sessionId: SessionIdentifier!` (usually `"1"`),
+`courseNumber: CourseNumber!` (e.g. `"61C"`), `number: ClassNumber!` (section,
+e.g. `"001"`). **These are distinct custom scalars, not `String`** — declaring
+a query variable as `$courseNumber: String!` fails at runtime with "used in
+position expecting type CourseNumber!" even though the value you pass is a
+plain string. Declare the variable with the exact scalar name the field
+expects (check via `introspect --type <ParentType>` if unsure) and the string
+value passes through fine.
 
 ## Other useful root queries
 

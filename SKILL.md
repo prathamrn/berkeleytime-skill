@@ -6,11 +6,12 @@ description: >-
   a given term — finding, filtering, ranking, or comparing courses by breadth
   requirement, average grade / A-rate, student-reported workload & difficulty,
   open (non-reserved) seats, units, meeting days/times, level (lower/upper/grad),
-  grading basis (P/NP), department, or university requirements (American Cultures,
-  R&C); pulling a class's full letter-grade distribution or rich details; or any
-  bulk "give me all the classes that …" consolidation task. ALWAYS present results
-  as a table. Falls back to live GraphQL introspection for anything not documented
-  here.
+  grading basis (P/NP), department, university requirements (American Cultures,
+  R&C), instructor (e.g. "what is professor X teaching this term"), meeting
+  location/room, or waitlist/enrollment status; pulling a class's full
+  letter-grade distribution or rich details; or any bulk "give me all the
+  classes that …" consolidation task. ALWAYS present results as a table. Falls
+  back to live GraphQL introspection for anything not documented here.
 ---
 
 # Berkeleytime course data
@@ -50,7 +51,8 @@ either or both explicitly when you need a different term.
 **Server-side sort:** `--sort RELEVANCE|AVERAGE_GRADE|UNITS|OPEN_SEATS` `--order ASC|DESC`.
 
 **Consolidation / local:** `--exclude-languages` · `--collapse-crosslist` ·
-`--min-grade 3.5` · `--sort-local grade|workload|difficulty|open|units|...` `--asc`.
+`--min-grade 3.5` · `--instructor "Name"` (substring match, case-insensitive —
+see below) · `--sort-local grade|workload|difficulty|open|units|...` `--asc`.
 
 **Output:** `--format md|table|csv|json` (default `table`) ·
 `--fields grade,code,title,open,cap,units,workload,difficulty,usefulness,recommended,sections,meet`.
@@ -58,7 +60,30 @@ either or both explicitly when you need a different term.
 Available columns: `grade` (all-time avg GPA, proxy for A-rate), `code`,
 `title`, `open`/`cap` (non-reserved open seats / total), `units`, `workload`,
 `difficulty`, `usefulness`, `recommended` (student-rated, weighted avg — pulled
-inline, no extra request), `sections`, `meet` (decoded days + times).
+inline, no extra request), `sections`, `meet` (decoded days + times),
+`instructor` (comma-joined names across all sections of that course),
+`location` (semicolon-joined room(s)), `waitlist` (`waitlisted/maxWaitlist`),
+`status` (raw enrollment status codes, e.g. `O`/`C`/`W`), `online`
+(`Yes`/`No`/`Mixed`).
+
+### Finding who teaches what / where / room capacity
+
+"What is professor X teaching this term" is a **bulk instructor lookup**, not
+a single-class lookup — use `search --instructor "Name"`, not `details`
+(which needs an exact subject+course-number+section you don't have yet) and
+not `--search "Name"` (that's full-text over titles/descriptions, not
+instructor rosters — it will not find them). `--instructor` fetches the whole
+term (optionally narrowed with `--departments`/`--breadths` if you already
+know the area) and filters locally on `meetings.instructors`, so it also
+surfaces cross-department teaching (e.g. a CS professor guest-teaching a
+seminar) that a department-scoped guess would miss. It's a substring match on
+`"Given Family"`, so a short/common surname can over-match (`"Hug"` also
+matches `"Hughes"`) — eyeball the results.
+
+```bash
+bt.py search --instructor "Hug" --collapse-crosslist \
+  --fields instructor,code,title,open,cap,meet,location,status --format md
+```
 
 ### Other subcommands
 - `filter-options [term]` — list every valid `--breadths`, `--levels`,

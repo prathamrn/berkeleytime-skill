@@ -19,6 +19,8 @@ Examples:
         --sort-local grade --format md
   bt.py search --breadths "Social & Behavioral Sciences" --sort AVERAGE_GRADE \
         --min-grade 3.5 --time-from 10:00 --time-to 16:00 --format table
+  bt.py search --departments ELENG --instructor "Hug" \
+        --fields instructor,code,title,meet,location --format md
   bt.py filter-options
   bt.py introspect --type CatalogFilters
   bt.py raw --file q.graphql --vars '{"y":2026,"s":"Fall"}'
@@ -37,14 +39,19 @@ except Exception:
 _SSL_CTX_UNVERIFIED = ssl._create_unverified_context()
 
 # ---- known-good full result selection for catalogSearch ----------------------
+# meetings.instructors / .location are undocumented in the public schema but
+# present on CatalogMeeting (verified live via introspect --type CatalogMeeting) —
+# this is the only way to get instructor names in bulk (one call for a whole
+# term/department), vs. `details`/raw `class(...)` which is per-class.
 CATALOG_RESULT_FIELDS = """
   year semester sessionId subject courseNumber number title
   unitsMin unitsMax courseTitle
   allTimeAverageGrade allTimePassCount allTimeNoPassCount
   enrolledCount maxEnroll activeReservedMaxCount
+  waitlistedCount maxWaitlist enrollmentStatus primaryOnline
   aggregatedRatings { metrics { metricName count weightedAverage } }
   decal { title }
-  meetings { days startTime endTime }
+  meetings { days startTime endTime location instructors { givenName familyName } }
 """
 
 CATALOG_SEARCH_QUERY = """
@@ -188,7 +195,11 @@ def build_filters(a):
 
 
 def fetch_all(a, filters):
-    page, out = 1, []
+    # The server silently caps pageSize at 100 regardless of what's requested
+    # (verified: pageSize=150/200 both return exactly 100 rows/page). Stop on
+    # totalCount, not on "got fewer than we asked for" — that comparison lies
+    # whenever --page-size is set above the real cap and would drop the tail.
+    page, out, total = 1, [], None
     while True:
         d = gql(CATALOG_SEARCH_QUERY, {
             "year": a.year, "semester": a.semester, "search": a.search,
@@ -197,8 +208,10 @@ def fetch_all(a, filters):
             "semanticSearch": a.semantic})
         cs = (d.get("catalogSearch") or {})
         res = cs.get("results") or []
+        if cs.get("totalCount") is not None:
+            total = cs["totalCount"]
         out.extend(res)
-        if len(res) < a.page_size:
+        if not res or (total is not None and len(out) >= total):
             break
         page += 1
     return out
@@ -219,11 +232,18 @@ def consolidate(rows, a):
                  "title": r.get("courseTitle"), "grade": r.get("allTimeAverageGrade"),
                  "unitsMin": r.get("unitsMin"), "unitsMax": r.get("unitsMax"),
                  "open": 0, "cap": 0, "sections": 0, "ratings": {},
-                 "meetings": set()}
+                 "meetings": set(), "instructor_set": set(), "location_set": set(),
+                 "waitlisted": 0, "maxWaitlist": 0, "status_set": set(), "online_flags": set()}
             by_code[k] = e
         e["open"] += (r.get("maxEnroll") or 0) - (r.get("enrolledCount") or 0)
         e["cap"] += (r.get("maxEnroll") or 0)
         e["sections"] += 1
+        e["waitlisted"] += r.get("waitlistedCount") or 0
+        e["maxWaitlist"] += r.get("maxWaitlist") or 0
+        if r.get("enrollmentStatus"):
+            e["status_set"].add(r["enrollmentStatus"])
+        if r.get("primaryOnline") is not None:
+            e["online_flags"].add(r["primaryOnline"])
         if r.get("allTimeAverageGrade") is not None:
             e["grade"] = r["allTimeAverageGrade"]
         if not e["ratings"]:
@@ -231,6 +251,12 @@ def consolidate(rows, a):
         for m in (r.get("meetings") or []):
             e["meetings"].add((decode_days(m.get("days")),
                                (m.get("startTime") or "")[:5], (m.get("endTime") or "")[:5]))
+            for i in (m.get("instructors") or []):
+                nm = f"{i.get('givenName') or ''} {i.get('familyName') or ''}".strip()
+                if nm:
+                    e["instructor_set"].add(nm)
+            if m.get("location"):
+                e["location_set"].add(m["location"])
 
     items = list(by_code.values())
     if a.collapse_crosslist:
@@ -243,6 +269,10 @@ def consolidate(rows, a):
                 m = dict(e); m["codes"] = []; merged[k] = m
             m["codes"].append(f'{e["subject"]} {e["courseNumber"]}')
             m["meetings"] |= e["meetings"]
+            m["instructor_set"] |= e["instructor_set"]
+            m["location_set"] |= e["location_set"]
+            m["status_set"] |= e["status_set"]
+            m["online_flags"] |= e["online_flags"]
         items = list(merged.values())
         for m in items:
             m["code"] = " / ".join(sorted(m["codes"]))
@@ -258,9 +288,20 @@ def consolidate(rows, a):
         um, uM = e.get("unitsMin"), e.get("unitsMax")
         e["units"] = str(um) if um == uM else f"{um}-{uM}"
         e["meet"] = "; ".join(f"{d} {s}-{en}" for d, s, en in sorted(e["meetings"]) if d) or "TBA"
+        e["instructor"] = ", ".join(sorted(e["instructor_set"])) or "—"
+        e["location"] = "; ".join(sorted(e["location_set"])) or "TBA"
+        e["waitlist"] = f'{e["waitlisted"]}/{e["maxWaitlist"]}' if e["maxWaitlist"] else "—"
+        e["status"] = ", ".join(sorted(e["status_set"])) or "—"
+        flags = e["online_flags"]
+        e["online"] = "Yes" if flags == {True} else "No" if flags == {False} else (
+            "Mixed" if flags else "—")
 
     if a.min_grade is not None:
         items = [e for e in items if (e["grade"] or 0) >= a.min_grade]
+
+    if a.instructor:
+        needle = a.instructor.lower()
+        items = [e for e in items if needle in e["instructor"].lower()]
 
     # local sort
     key = a.sort_local
@@ -444,6 +485,8 @@ def main():
     s.add_argument("--collapse-crosslist", action="store_true",
                    help="merge cross-listed courses onto one row")
     s.add_argument("--min-grade", type=float)
+    s.add_argument("--instructor", help="filter to classes with an instructor name "
+                   "matching this substring, case-insensitive (e.g. 'Hug')")
     s.add_argument("--sort-local", help="re-sort locally by any output column "
                    "(grade, workload, difficulty, open, units, ...)")
     s.add_argument("--asc", action="store_true", help="ascending local sort")
