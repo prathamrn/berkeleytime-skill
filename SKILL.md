@@ -64,7 +64,14 @@ inline, no extra request), `sections`, `meet` (decoded days + times),
 `instructor` (comma-joined names across all sections of that course),
 `location` (semicolon-joined room(s)), `waitlist` (`waitlisted/maxWaitlist`),
 `status` (raw enrollment status codes, e.g. `O`/`C`/`W`), `online`
-(`Yes`/`No`/`Mixed`).
+(`Yes`/`No`/`Mixed`), `breadths` (comma-joined `breadthRequirements` — which
+breadth(s) a class satisfies; a class can carry more than one, pick the one
+you need since only one counts per class), `univ_reqs` (comma-joined
+`universityRequirements`, e.g. American Cultures, R&C).
+
+For "which breadth(s) does class X fulfill" questions, just add
+`--fields grade,code,title,breadths` — don't reach for `introspect`/`raw`,
+this is a normal search column.
 
 ### Finding who teaches what / where / room capacity
 

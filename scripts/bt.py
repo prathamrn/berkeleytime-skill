@@ -49,6 +49,7 @@ CATALOG_RESULT_FIELDS = """
   allTimeAverageGrade allTimePassCount allTimeNoPassCount
   enrolledCount maxEnroll activeReservedMaxCount
   waitlistedCount maxWaitlist enrollmentStatus primaryOnline
+  breadthRequirements universityRequirements
   aggregatedRatings { metrics { metricName count weightedAverage } }
   decal { title }
   meetings { days startTime endTime location instructors { givenName familyName } }
@@ -233,7 +234,8 @@ def consolidate(rows, a):
                  "unitsMin": r.get("unitsMin"), "unitsMax": r.get("unitsMax"),
                  "open": 0, "cap": 0, "sections": 0, "ratings": {},
                  "meetings": set(), "instructor_set": set(), "location_set": set(),
-                 "waitlisted": 0, "maxWaitlist": 0, "status_set": set(), "online_flags": set()}
+                 "waitlisted": 0, "maxWaitlist": 0, "status_set": set(), "online_flags": set(),
+                 "breadth_set": set(), "univ_req_set": set()}
             by_code[k] = e
         e["open"] += (r.get("maxEnroll") or 0) - (r.get("enrolledCount") or 0)
         e["cap"] += (r.get("maxEnroll") or 0)
@@ -242,6 +244,8 @@ def consolidate(rows, a):
         e["maxWaitlist"] += r.get("maxWaitlist") or 0
         if r.get("enrollmentStatus"):
             e["status_set"].add(r["enrollmentStatus"])
+        e["breadth_set"].update(r.get("breadthRequirements") or [])
+        e["univ_req_set"].update(r.get("universityRequirements") or [])
         if r.get("primaryOnline") is not None:
             e["online_flags"].add(r["primaryOnline"])
         if r.get("allTimeAverageGrade") is not None:
@@ -273,6 +277,8 @@ def consolidate(rows, a):
             m["location_set"] |= e["location_set"]
             m["status_set"] |= e["status_set"]
             m["online_flags"] |= e["online_flags"]
+            m["breadth_set"] |= e["breadth_set"]
+            m["univ_req_set"] |= e["univ_req_set"]
         items = list(merged.values())
         for m in items:
             m["code"] = " / ".join(sorted(m["codes"]))
@@ -292,6 +298,8 @@ def consolidate(rows, a):
         e["location"] = "; ".join(sorted(e["location_set"])) or "TBA"
         e["waitlist"] = f'{e["waitlisted"]}/{e["maxWaitlist"]}' if e["maxWaitlist"] else "—"
         e["status"] = ", ".join(sorted(e["status_set"])) or "—"
+        e["breadths"] = ", ".join(sorted(e["breadth_set"])) or "—"
+        e["univ_reqs"] = ", ".join(sorted(e["univ_req_set"])) or "—"
         flags = e["online_flags"]
         e["online"] = "Yes" if flags == {True} else "No" if flags == {False} else (
             "Mixed" if flags else "—")
