@@ -1,13 +1,14 @@
 # berkeleytime CLI / claude skill
 
-Interact with Berkeleytime using an AI agent! Ask Claude Code things like:
+Interact with Berkeleytime (and Rate My Professors) using an AI agent! Ask Claude Code things like:
 
 - "easiest open Arts & Literature classes with seats, ranked by estimated workload"
 - "american cultures classes that aren't on Mondays from 4PM to 5PM"
+- "when is the best time to take cs 189 according to rate my professors ratings in the past 3 years and average gpa of their sections"
 - "music department classes with the highest GPA that fulfill any breadth, with non-reserved open seats"
-- "which breadths does espm 50ac fulfill" (this one could take a minute)
-
-*It is suggested to run the skill with Claude in **auto** mode*
+- "which breadths does espm 50ac fulfill"
+- "does the professor for CS70 have a higher rate my professors rating than the one for last semester"
+- "make me a schedule for this semester as a sophomore cogsci major who's taken x, y, and z"
 
 Experiment with what you can do! Not everything is documented in the repo, but the agent can use introspection to determine if it's possible.
 
@@ -49,9 +50,12 @@ python3 scripts/bt.py search --breadths "Historical Studies" \
 
 # Full letter-grade distribution for one class
 python3 scripts/bt.py grades --subject COMPSCI --course-number 61C --number 001
+
+# RateMyProfessors rating + profile link (defaults to UC Berkeley)
+python3 scripts/bt.py rmp --name "Paul Hilfinger"
 ```
 
-Subcommands: `search`, `filter-options`, `grades`, `details`, `introspect`, `raw`.
+Subcommands: `search`, `filter-options`, `grades`, `details`, `introspect`, `raw`, `rmp`.
 Run `python3 scripts/bt.py -h` or `<subcommand> -h` for every flag.
 Term defaults to **Fall 2026**; override with `--year` / `--semester`.
 
@@ -61,6 +65,9 @@ difficulty, usefulness, recommended, sections, meet`.
 
 ## Disclaimer
 Using the skill isn't perfect and should be checked on Berkeley's official course catalog.
+The `rmp` subcommand queries RateMyProfessors' own public API directly; this project is
+not affiliated with RateMyProfessors either, and ratings reflect self-selected student
+reviews, not an official metric.
 
 ## License
 

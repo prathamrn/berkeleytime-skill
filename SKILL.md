@@ -9,9 +9,10 @@ description: >-
   grading basis (P/NP), department, university requirements (American Cultures,
   R&C), instructor (e.g. "what is professor X teaching this term"), meeting
   location/room, or waitlist/enrollment status; pulling a class's full
-  letter-grade distribution or rich details; or any bulk "give me all the
-  classes that …" consolidation task. ALWAYS present results as a table. Falls
-  back to live GraphQL introspection for anything not documented here.
+  letter-grade distribution or rich details; a professor's RateMyProfessors
+  rating and profile link; or any bulk "give me all the classes that …"
+  consolidation task. ALWAYS present results as a table. Falls back to live
+  GraphQL introspection for anything not documented here.
 ---
 
 # Berkeleytime course data
@@ -91,6 +92,23 @@ matches `"Hughes"`) — eyeball the results.
 bt.py search --instructor "Hug" --collapse-crosslist \
   --fields instructor,code,title,open,cap,meet,location,status --format md
 ```
+
+### RateMyProfessors rating + link
+
+If the user asks for a professor's RateMyProfessors rating, difficulty, or a
+link to their RMP page, use `rmp` — a small standalone lookup against RMP's own
+public GraphQL API (not Berkeleytime's), scoped to UC Berkeley by default:
+
+```bash
+bt.py rmp --name "Paul Hilfinger" --format md
+```
+
+Returns rating (out of 5), difficulty, number of ratings, would-take-again %,
+and the profile link (`ratemyprofessors.com/professor/<id>`) — give the user
+both the rating and that link. A common last name can return multiple rows;
+show all of them and let the user pick. `--school-id` overrides the default
+Berkeley scope (RMP numeric school ID) if ever needed for a cross-listed or
+visiting instructor elsewhere.
 
 ### Other subcommands
 - `filter-options [term]` — list every valid `--breadths`, `--levels`,

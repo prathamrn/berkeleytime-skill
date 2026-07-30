@@ -12,6 +12,7 @@ Subcommands:
   details         Rich class details (description, reqs, instructors, exam, enrollment).
   introspect      Schema introspection FALLBACK: --root | --type NAME | --enum NAME.
   raw             Run an arbitrary GraphQL query (inline or --file) with --vars JSON.
+  rmp             RateMyProfessors rating + profile link for a professor by name.
 
 Examples:
   bt.py search --breadths "Philosophy & Values" "Arts & Literature" \
@@ -140,24 +141,30 @@ def resolve_term(a):
             a.semester = semester
 
 
-def gql(query, variables=None, timeout=60):
-    body = json.dumps({"query": query, "variables": variables or {}}).encode()
-    req = urllib.request.Request(ENDPOINT, data=body, headers={
-        "content-type": "application/json",
-        # Cloudflare rejects the default python-urllib UA with an empty body.
-        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
-        "accept": "application/json"})
+DEFAULT_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36")
+
+
+def http_post_json(url, body, headers, timeout=60):
+    req = urllib.request.Request(url, data=body, headers=headers)
     try:
-        raw = urllib.request.urlopen(req, timeout=timeout, context=_SSL_CTX).read().decode("utf-8", "replace")
+        return urllib.request.urlopen(req, timeout=timeout, context=_SSL_CTX).read().decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
-        raw = e.read().decode("utf-8", "replace")
+        return e.read().decode("utf-8", "replace")
     except urllib.error.URLError as e:
         if isinstance(e.reason, ssl.SSLError):  # cert store missing → retry unverified
-            raw = urllib.request.urlopen(req, timeout=timeout,
-                                         context=_SSL_CTX_UNVERIFIED).read().decode("utf-8", "replace")
-        else:
-            raise
+            return urllib.request.urlopen(req, timeout=timeout,
+                                          context=_SSL_CTX_UNVERIFIED).read().decode("utf-8", "replace")
+        raise
+
+
+def gql(query, variables=None, timeout=60):
+    body = json.dumps({"query": query, "variables": variables or {}}).encode()
+    raw = http_post_json(ENDPOINT, body, {
+        "content-type": "application/json",
+        # Cloudflare rejects the default python-urllib UA with an empty body.
+        "user-agent": DEFAULT_UA,
+        "accept": "application/json"}, timeout)
     d = json.loads(raw, strict=False)  # strict=False: some titles carry raw control chars
     if d.get("errors"):
         sys.stderr.write("GraphQL errors: " + json.dumps(d["errors"], indent=2) + "\n")
@@ -448,6 +455,87 @@ def cmd_introspect(a):
         print(f"  field {f['name']}: {tn(f['type'])}")
 
 
+# ------------------------- RateMyProfessors lookup -----------------------------
+# Minimal port of the professor-search idea from tisuela/ratemyprof-api: given a
+# name, find the matching professor and surface their rating + profile link. That
+# repo's endpoints (ratemyprofessors.com/filter/professor, /paginate/professors/
+# ratings) are dead — RMP moved to a GraphQL API — so this hits RMP's own public
+# GraphQL endpoint instead, using the fixed "test:test" Basic auth every browser
+# sends (baked into RMP's client JS, not a real credential; no login/paywall
+# bypass involved — same public rating data is on ratemyprofessors.com).
+RMP_ENDPOINT = "https://www.ratemyprofessors.com/graphql"
+RMP_AUTH_HEADER = "Basic dGVzdDp0ZXN0"  # base64("test:test")
+RMP_UCB_NUMERIC_ID = "1072"  # ratemyprofessors.com/campusRatings.jsp?sid=1072
+
+RMP_SEARCH_QUERY = """
+query BtRmpSearch($text:String!,$schoolID:ID!){
+  newSearch{
+    teachers(query:{text:$text, schoolID:$schoolID}){
+      edges{ node{
+        legacyId firstName lastName department
+        avgRating avgDifficulty numRatings wouldTakeAgainPercent
+      } }
+    }
+  }
+}"""
+
+
+def rmp_school_gid(numeric_id):
+    import base64
+    return base64.b64encode(f"School-{numeric_id}".encode()).decode()
+
+
+def rmp_gql(query, variables, timeout=30):
+    body = json.dumps({"query": query, "variables": variables}).encode()
+    raw = http_post_json(RMP_ENDPOINT, body, {
+        "content-type": "application/json",
+        "authorization": RMP_AUTH_HEADER,
+        "user-agent": DEFAULT_UA,
+        "accept": "application/json"}, timeout)
+    d = json.loads(raw, strict=False)
+    if d.get("errors"):
+        sys.stderr.write("RMP GraphQL errors: " + json.dumps(d["errors"], indent=2) + "\n")
+    return d.get("data") or {}
+
+
+def cmd_rmp(a):
+    school_gid = rmp_school_gid(a.school_id)
+    d = rmp_gql(RMP_SEARCH_QUERY, {"text": a.name, "schoolID": school_gid})
+    edges = (((d.get("newSearch") or {}).get("teachers") or {}).get("edges") or [])
+    if not edges:
+        print(f"No RateMyProfessors match for {a.name!r}.")
+        sys.stderr.write("\n[0 rows]\n")
+        return
+    rows = []
+    for e in edges:
+        n = e["node"]
+        rating, difficulty, wta = n.get("avgRating"), n.get("avgDifficulty"), n.get("wouldTakeAgainPercent")
+        rows.append({
+            "name": f'{n.get("firstName","")} {n.get("lastName","")}'.strip(),
+            "department": n.get("department") or "—",
+            "rating": f'{rating:.1f}/5' if rating is not None else "—",
+            "difficulty": f'{difficulty:.1f}/5' if difficulty is not None else "—",
+            "num_ratings": n.get("numRatings") or 0,
+            "would_take_again": f'{wta:.0f}%' if wta is not None and wta >= 0 else "—",
+            "link": f'https://www.ratemyprofessors.com/professor/{n["legacyId"]}',
+        })
+    cols = ["name", "department", "rating", "difficulty", "num_ratings", "would_take_again", "link"]
+    if a.format == "json":
+        print(json.dumps(rows, indent=2))
+    elif a.format == "md":
+        print("| " + " | ".join(cols) + " |")
+        print("|" + "|".join("---" for _ in cols) + "|")
+        for r in rows:
+            print("| " + " | ".join(str(r[c]).replace("|", "\\|") for c in cols) + " |")
+    else:
+        widths = {c: max(len(c), *(len(str(r[c])) for r in rows)) for c in cols}
+        print("  ".join(c.ljust(widths[c]) for c in cols))
+        print("  ".join("-" * widths[c] for c in cols))
+        for r in rows:
+            print("  ".join(str(r[c]).ljust(widths[c]) for c in cols))
+    sys.stderr.write(f"\n[{len(rows)} rows]\n")
+
+
 # -------------------------------- raw -----------------------------------------
 def cmd_raw(a):
     query = open(a.file).read() if a.file else a.query
@@ -528,6 +616,13 @@ def main():
     r.add_argument("--file", help="path to a .graphql file")
     r.add_argument("--vars", help="JSON variables")
     r.set_defaults(func=cmd_raw)
+
+    rmp = sub.add_parser("rmp", help="RateMyProfessors rating + profile link")
+    rmp.add_argument("--name", required=True, help='professor name to search, e.g. "Paul Hilfinger"')
+    rmp.add_argument("--school-id", default=RMP_UCB_NUMERIC_ID,
+                     help="RMP numeric school ID (default: UC Berkeley, 1072)")
+    rmp.add_argument("--format", default="table", choices=["table", "md", "json"])
+    rmp.set_defaults(func=cmd_rmp)
 
     a = p.parse_args()
     if hasattr(a, "year"):
