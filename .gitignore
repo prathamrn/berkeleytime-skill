@@ -19,3 +19,6 @@ scratch/
 out/
 *.csv
 !references/*.csv
+
+# Generated persisted-operation manifest (rebuilt automatically by scripts/persisted.py)
+scripts/persisted-ops.json

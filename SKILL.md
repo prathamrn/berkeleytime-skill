@@ -12,13 +12,31 @@ description: >-
   letter-grade distribution or rich details; a professor's RateMyProfessors
   rating and profile link; or any bulk "give me all the classes that …"
   consolidation task. ALWAYS present results as a table. Falls back to live
-  GraphQL introspection for anything not documented here.
+  GraphQL operation-manifest lookup for anything not documented here.
 ---
 
 # Berkeleytime course data
 
 Access and consolidate UC Berkeley catalog data via the public GraphQL API at
 `https://berkeleytime.com/api/graphql` (POST JSON, **no auth** for reads).
+
+**The API only accepts persisted operations.** Sending a `query` string gets
+`{"error":"Invalid persisted operation request"}`. Requests must be
+`{"id": <sha256 of one of the web app's own documents>, "variables": {...}}`.
+`scripts/persisted.py` recovers that id set from berkeleytime.com's JS bundle
+into `scripts/persisted-ops.json` and `bt.py` handles it transparently
+(auto-rebuilt weekly, and on any rejection after a site deploy). Consequences:
+
+- **Schema introspection is gone.** `bt.py ops` lists every operation the API
+  will run; `bt.py ops --show NAME` prints its exact GraphQL source. That is the
+  fallback now — use it instead of guessing at fields.
+- **`catalogSearch` returns only what the web app selects.** Instructor,
+  location and waitlist are no longer in the bulk result, so those columns and
+  `--instructor` transparently trigger a per-class enrichment pass (one extra
+  request per class, threaded, capped by `--enrich-max`, default 400).
+  `breadths`/`univ_reqs` do the same per distinct *course*. `--no-enrich` skips
+  it. Everything else (grades, ratings, seats, units, meeting times, all the
+  server-side filters and sorts) still comes back in one bulk call.
 
 **Golden rule: every answer is a table.** Whatever the user asks for, run the
 query and present the results as a table (Markdown by default so it renders in
@@ -53,7 +71,8 @@ either or both explicitly when you need a different term.
 
 **Consolidation / local:** `--exclude-languages` · `--collapse-crosslist` ·
 `--min-grade 3.5` · `--instructor "Name"` (substring match, case-insensitive —
-see below) · `--sort-local grade|workload|difficulty|open|units|...` `--asc`.
+see below) · `--sort-local grade|workload|difficulty|open|units|...` `--asc` ·
+`--enrich-max N` / `--no-enrich` (per-class enrichment, see above).
 
 **Output:** `--format md|table|csv|json` (default `table`) ·
 `--fields grade,code,title,open,cap,units,workload,difficulty,usefulness,recommended,sections,meet`.
@@ -64,15 +83,18 @@ Available columns: `grade` (all-time avg GPA, proxy for A-rate), `code`,
 inline, no extra request), `sections`, `meet` (decoded days + times),
 `instructor` (comma-joined names across all sections of that course),
 `location` (semicolon-joined room(s)), `waitlist` (`waitlisted/maxWaitlist`),
-`status` (raw enrollment status codes, e.g. `O`/`C`/`W`), `online`
-(`Yes`/`No`/`Mixed`), `breadths` (comma-joined `breadthRequirements` — which
+`breadths` (comma-joined `breadthRequirements` — which
 breadth(s) a class satisfies; a class can carry more than one, pick the one
 you need since only one counts per class), `univ_reqs` (comma-joined
 `universityRequirements`, e.g. American Cultures, R&C).
 
+`instructor`, `location` and `waitlist` cost one request per class;
+`breadths`/`univ_reqs` one per course. `status` and `online` are no longer
+obtainable in bulk — use the `--enrollment` / `--online` server filters instead.
+
 For "which breadth(s) does class X fulfill" questions, just add
-`--fields grade,code,title,breadths` — don't reach for `introspect`/`raw`,
-this is a normal search column.
+`--fields grade,code,title,breadths` — don't reach for `ops`/`raw`, this is a
+normal search column (it costs one lookup per course, see enrichment above).
 
 ### Finding who teaches what / where / room capacity
 
@@ -112,13 +134,14 @@ visiting instructor elsewhere.
 
 ### Other subcommands
 - `filter-options [term]` — list every valid `--breadths`, `--levels`,
-  `--grading`, `--university-reqs`, `--departments` value for the term.
+  `--grading`, `--university-reqs` value for the term (`--departments` values
+  are no longer exposed; the filter itself still works with subject codes).
 - `grades --subject COMPSCI --course-number 61C --number 001` — full letter
   distribution (A+…F counts) + P/NP %.
 - `details --subject … --course-number … --number …` — description, requirements,
   instructors, exam, live enrollment.
-- `introspect` — **the fallback** (see below).
-- `raw --file q.graphql --vars '{...}'` (or `--query "..."`) — arbitrary GraphQL.
+- `ops [--grep TEXT] [--show NAME] [--refresh]` — **the fallback** (see below).
+- `raw --op NAME --vars '{...}'` — run one persisted operation directly.
 
 ## Workflow
 
@@ -160,18 +183,20 @@ Multiple `--breadths` are OR'd (a class matching any of them). Because you can
 only claim **one** breadth per class, the `code`/`breadths` result is the menu
 of options, not additive credit.
 
-## Introspection fallback (REQUIRED for anything undocumented)
+## Fallback for anything undocumented (REQUIRED — do not guess)
 
-If the user asks for a field, filter, enum, sort, or root query **not covered
-above or in `references/schema.md`**, do not guess — discover it live:
+Introspection is blocked by the persisted-operation gate, so the manifest *is*
+the schema you can reach. If the user asks for something **not covered above or
+in `references/schema.md`**, look for an operation that already selects it:
 
 ```bash
-python3 scripts/bt.py introspect --root              # all Query + Mutation fields
-python3 scripts/bt.py introspect --type CatalogFilters   # input/object type shape
-python3 scripts/bt.py introspect --enum EnrollmentFilterType   # enum values
+python3 scripts/bt.py ops                        # every operation the API accepts
+python3 scripts/bt.py ops --grep instructors     # which ones select a given field
+python3 scripts/bt.py ops --show GetClassDetails # its id + exact GraphQL source
+python3 scripts/bt.py raw --op GetClassDetails --vars '{"year":2026,...}'
 ```
 
-Then use `raw` to run the newly-discovered query/fields, and still present the
-result as a table. See `references/schema.md` for the full documented surface
+If no operation selects the field, it is genuinely unreachable — say so rather
+than inventing a query. Present whatever you do get as a table. See `references/schema.md` for the full documented surface
 (enums, filter inputs, all 12 breadths, result fields, ratings metrics, other
 root queries, and the `days` bitmask).
