@@ -5,8 +5,11 @@ for reads. Cloudflare rejects the default `python-urllib` User-Agent, so send a
 browser UA (the script does). Some course titles contain raw control characters —
 parse JSON with `strict=False` (Python) or a lenient parser.
 
-Everything below was captured via live introspection and verified against the API.
-Anything not here → use `bt.py introspect` (see bottom).
+Everything below was captured via live introspection (back when the API allowed
+it) and verified against the API. Introspection is now blocked — the endpoint
+only runs persisted operations — so anything not here → `bt.py ops` (see bottom).
+Fields marked **(gone from bulk)** are still real schema fields but are no longer
+selected by any bulk operation the API will run.
 
 ## catalogSearch — the main query
 
@@ -46,7 +49,7 @@ meetings { days startTime endTime location instructors { givenName familyName } 
   Workload/Difficulty/Usefulness/Recommended.
 - **`meetings.instructors` and `meetings.location`** — undocumented in the
   public API surface but present on `CatalogMeeting` (found via
-  `introspect --type CatalogMeeting`) and wired into `bt.py search` as it now
+  introspection, back when it was allowed) and wired into `bt.py search` as it now
   requests them by default. This is the only way to get instructors **in
   bulk** (one call, any term/department/search-text combo) — `bt.py details`
   only gets you one class at a time. Use `search --instructor "Name"` (local
@@ -74,7 +77,7 @@ meetings { days startTime endTime location instructors { givenName familyName } 
 | `universityRequirements` | [String] | AC / American History / R&C etc. |
 | `online` | Boolean | online/async only |
 
-> Input list fields accept a JSON array (`["International Studies"]`). Introspection
+> Input list fields accept a JSON array (`["International Studies"]`). Introspection (historical)
 > reports the inner scalar (`String`); arrays are what the client sends and what works.
 >
 > **`days`** is `[Int]` (a list of day indices), not a bitmask. Indices most
@@ -147,7 +150,7 @@ e.g. `"001"`). **These are distinct custom scalars, not `String`** — declaring
 a query variable as `$courseNumber: String!` fails at runtime with "used in
 position expecting type CourseNumber!" even though the value you pass is a
 plain string. Declare the variable with the exact scalar name the field
-expects (check via `introspect --type <ParentType>` if unsure) and the string
+expects (check a persisted operation's source via `ops --show` if unsure) and the string
 value passes through fine.
 
 ## Other useful root queries
@@ -164,23 +167,15 @@ There are also ~60 **mutations** (schedules, collections, plans, banners, staff,
 targeted messages) — these generally require authentication and are out of scope
 for read/consolidation tasks.
 
-## Introspection (fallback)
+## Operation manifest (fallback)
+
+Introspection returns `Invalid persisted operation request`; the set of runnable
+documents is the schema you can reach.
 
 ```bash
-bt.py introspect --root                    # every Query + Mutation field
-bt.py introspect --type CatalogFilters     # input/object field list w/ types
-bt.py introspect --enum EnrollmentFilterType
+bt.py ops                                  # every operation the API accepts
+bt.py ops --grep enrollmentStatus          # which operations select a field
+bt.py ops --show GetCatalogSearch          # exact GraphQL source + persisted id
+bt.py ops --refresh                        # rebuild after a site deploy
 ```
 
-Raw introspection query if you need it directly:
-
-```graphql
-query($n:String!){ __type(name:$n){ name kind
-  enumValues{ name } inputFields{ name type{ name kind ofType{ name kind } } }
-  fields{ name type{ name kind ofType{ name kind } } } } }
-```
-
-Type catalog (partial, from `__schema.types`): `CatalogResult`, `CatalogClass`,
-`CatalogSection`, `CatalogMeeting`, `CatalogInstructor`, `CatalogDeCal`,
-`CatalogExam`, `CatalogFilterOptions`, `AggregatedRatings`, `CatalogMetric`,
-`Category`, plus the enums above. Introspect any of them for exact fields.

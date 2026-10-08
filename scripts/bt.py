@@ -10,9 +10,20 @@ Subcommands:
   filter-options  Dump valid filter values (breadths, levels, grading, reqs) for a term.
   grades          Full letter grade distribution for one class.
   details         Rich class details (description, reqs, instructors, exam, enrollment).
-  introspect      Schema introspection FALLBACK: --root | --type NAME | --enum NAME.
-  raw             Run an arbitrary GraphQL query (inline or --file) with --vars JSON.
+  ops             List/show the persisted operations the API accepts (see below).
+  raw             Run one persisted operation by name: --op NAME --vars JSON.
   rmp             RateMyProfessors rating + profile link for a professor by name.
+
+NOTE — persisted operations. The API rejects arbitrary GraphQL documents
+("Invalid persisted operation request"); it only accepts {id, variables} where
+id is the sha256 of a document shipped in berkeleytime.com's own JS bundle.
+scripts/persisted.py recovers that id set from the live bundle and caches it in
+scripts/persisted-ops.json (auto-refreshed weekly, or on a rejection). Two
+consequences: schema introspection is gone (`ops --show NAME` replaces it), and
+catalogSearch returns only the fields the web app asks for. Instructor,
+location and waitlist are no longer in the bulk result, so `--instructor` and
+the instructor/location/waitlist columns trigger a per-class enrichment pass
+(one extra request per class, threaded) — see --enrich.
 
 Examples:
   bt.py search --breadths "Philosophy & Values" "Arts & Literature" \
@@ -23,10 +34,12 @@ Examples:
   bt.py search --departments ELENG --instructor "Hug" \
         --fields instructor,code,title,meet,location --format md
   bt.py filter-options
-  bt.py introspect --type CatalogFilters
-  bt.py raw --file q.graphql --vars '{"y":2026,"s":"Fall"}'
+  bt.py ops --show GetCatalogSearch
+  bt.py raw --op GetTerms
 """
-import argparse, json, sys, ssl, urllib.request, urllib.error
+import argparse, json, os, sys, ssl, urllib.request, urllib.error
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import persisted
 
 ENDPOINT = "https://berkeleytime.com/api/graphql"
 
@@ -39,56 +52,17 @@ except Exception:
     _SSL_CTX = ssl.create_default_context()
 _SSL_CTX_UNVERIFIED = ssl._create_unverified_context()
 
-# ---- known-good full result selection for catalogSearch ----------------------
-# meetings.instructors / .location are undocumented in the public schema but
-# present on CatalogMeeting (verified live via introspect --type CatalogMeeting) —
-# this is the only way to get instructor names in bulk (one call for a whole
-# term/department), vs. `details`/raw `class(...)` which is per-class.
-CATALOG_RESULT_FIELDS = """
-  year semester sessionId subject courseNumber number title
-  unitsMin unitsMax courseTitle
-  allTimeAverageGrade allTimePassCount allTimeNoPassCount
-  enrolledCount maxEnroll activeReservedMaxCount
-  waitlistedCount maxWaitlist enrollmentStatus primaryOnline
-  breadthRequirements universityRequirements
-  aggregatedRatings { metrics { metricName count weightedAverage } }
-  decal { title }
-  meetings { days startTime endTime location instructors { givenName familyName } }
-"""
-
-CATALOG_SEARCH_QUERY = """
-query BtSearch($year:Int!,$semester:Semester!,$search:String,$filters:CatalogFilters,
-               $sortBy:CatalogSortBy,$sortOrder:SortOrder,$page:Int,$pageSize:Int,$semanticSearch:Boolean){
-  catalogSearch(year:$year,semester:$semester,search:$search,filters:$filters,
-                sortBy:$sortBy,sortOrder:$sortOrder,page:$page,pageSize:$pageSize,
-                semanticSearch:$semanticSearch){
-    totalCount
-    results { %s }
-  }
-}""" % CATALOG_RESULT_FIELDS
-
-CLASS_KEY_ARGS = """$year:Int!,$semester:Semester!,$sessionId:SessionIdentifier!,
-  $subject:String!,$courseNumber:CourseNumber!,$number:ClassNumber!"""
-CLASS_KEY_PASS = """year:$year,semester:$semester,sessionId:$sessionId,
-  subject:$subject,courseNumber:$courseNumber,number:$number"""
-
-GRADES_QUERY = """
-query BtGrades(%s){ class(%s){ course { gradeDistribution {
-  average pnpPercentage
-  distribution { letter count } } } } }""" % (CLASS_KEY_ARGS, CLASS_KEY_PASS)
-
-DETAILS_QUERY = """
-query BtDetails(%s){ class(%s){
-  courseId number unitsMin unitsMax finalExam
-  course { title description requirements
-    gradeDistribution { average pnpPercentage }
-    aggregatedRatings { metrics { metricName count weightedAverage } } }
-  primarySection { component
-    enrollment { latest { enrolledCount maxEnroll waitlistedCount maxWaitlist } }
-    exams { date startTime endTime location type }
-    meetings { days location startTime endTime
-      instructors { familyName givenName } } }
-} }""" % (CLASS_KEY_ARGS, CLASS_KEY_PASS)
+# ---- persisted operation names used below ------------------------------------
+# These are the web app's own documents; `ops --show NAME` prints their exact
+# selection sets. Fields the app does not select are simply not obtainable in
+# bulk any more (see the NOTE in the module docstring).
+OP_SEARCH   = "GetCatalogSearch"      # catalogSearch: no instructors/location/waitlist
+OP_TERMS    = "GetTerms"
+OP_FILTERS  = "GetCatalogFilterOptions"
+OP_DETAILS  = "GetClassDetails"       # per class: primarySection meetings + enrollment
+OP_REQS     = "GetCourseRequirements" # per course: requirement designations / attributes
+OP_COURSE_GRADES = "GetCourseGradeDist"
+OP_GRADE_DIST    = "GetGradeDistribution"
 
 # Language subject codes + language-instruction title pattern (for --exclude-languages)
 LANG_SUBJECTS = {"CHINESE","JAPAN","KOREAN","FRENCH","GERMAN","SPANISH","ITALIAN","PORTUG",
@@ -116,16 +90,15 @@ def latest_term():
     False. So pull every known term and probe catalogSearch directly, newest
     first, returning the first one that actually has results.
     """
-    d = gql("{ terms(withCatalogData: false) { year semester } }")
+    d = gql(OP_TERMS)
     terms = d.get("terms") or []
     if not terms:
         raise SystemExit("Could not determine the latest term (terms query returned none).")
     uniq = {(t["year"], t["semester"]) for t in terms}
     ordered = sorted(uniq, key=lambda t: (t[0], _TERM_RANK.get(t[1], 0)), reverse=True)
-    probe = """query($y:Int!,$s:Semester!){
-      catalogSearch(year:$y,semester:$s,page:1,pageSize:1){ totalCount } }"""
     for year, semester in ordered:
-        r = gql(probe, {"y": year, "s": semester})
+        r = gql(OP_SEARCH, {"year": year, "semester": semester,
+                            "page": 1, "pageSize": 1})
         if ((r.get("catalogSearch") or {}).get("totalCount") or 0) > 0:
             return year, semester
     raise SystemExit("No term with catalog data found.")
@@ -158,14 +131,30 @@ def http_post_json(url, body, headers, timeout=60):
         raise
 
 
-def gql(query, variables=None, timeout=60):
-    body = json.dumps({"query": query, "variables": variables or {}}).encode()
-    raw = http_post_json(ENDPOINT, body, {
+def gql(op, variables=None, timeout=60, _refreshed=False):
+    """Run one persisted operation by name, posting {id, variables}."""
+    man = persisted.load_manifest()
+    entry = man["ops"].get(op)
+    if entry is None:
+        if not _refreshed:
+            persisted.load_manifest(refresh=True)
+            return gql(op, variables, timeout, _refreshed=True)
+        raise SystemExit(f"No persisted operation named {op!r}. Try: bt.py ops")
+    payload = {"id": entry["id"]}
+    if variables is not None:
+        payload["variables"] = variables
+    raw = http_post_json(ENDPOINT, json.dumps(payload).encode(), {
         "content-type": "application/json",
         # Cloudflare rejects the default python-urllib UA with an empty body.
         "user-agent": DEFAULT_UA,
         "accept": "application/json"}, timeout)
     d = json.loads(raw, strict=False)  # strict=False: some titles carry raw control chars
+    if d.get("error") and not _refreshed:
+        # Stale manifest (the site redeployed and every id rotated) — rebuild once.
+        persisted.load_manifest(refresh=True)
+        return gql(op, variables, timeout, _refreshed=True)
+    if d.get("error"):
+        raise SystemExit(f"API rejected {op}: {d['error']}")
     if d.get("errors"):
         sys.stderr.write("GraphQL errors: " + json.dumps(d["errors"], indent=2) + "\n")
     return d.get("data") or {}
@@ -209,7 +198,7 @@ def fetch_all(a, filters):
     # whenever --page-size is set above the real cap and would drop the tail.
     page, out, total = 1, [], None
     while True:
-        d = gql(CATALOG_SEARCH_QUERY, {
+        d = gql(OP_SEARCH, {
             "year": a.year, "semester": a.semester, "search": a.search,
             "filters": filters, "sortBy": a.sort, "sortOrder": a.order,
             "page": page, "pageSize": a.page_size,
@@ -223,6 +212,102 @@ def fetch_all(a, filters):
             break
         page += 1
     return out
+
+
+ENRICH_FIELDS = {"instructor", "location", "waitlist"}
+COURSE_FIELDS = {"breadths", "univ_reqs"}
+
+
+def _class_key_of(r):
+    return {"year": r["year"], "semester": r["semester"], "sessionId": r.get("sessionId") or "1",
+            "subject": r["subject"], "courseNumber": r["courseNumber"], "number": r["number"]}
+
+
+def _thread_map(fn, items, workers=12):
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        return list(ex.map(fn, items))
+
+
+def enrich_rows(rows, a):
+    """Refill instructor / location / waitlist, one persisted call per class.
+
+    catalogSearch used to carry meetings.instructors, meetings.location and the
+    waitlist counts; the app's persisted document drops them, so the only route
+    left is the per-class document. That is one request per class, so it is
+    opt-in (auto-enabled when those columns or --instructor are asked for) and
+    capped by --enrich-max.
+    """
+    if len(rows) > a.enrich_max:
+        sys.stderr.write(
+            f"[enrich] {len(rows)} classes exceeds --enrich-max {a.enrich_max}; "
+            "narrow the search (e.g. --departments) or raise the cap. "
+            "Instructor/location/waitlist will be blank.\n")
+        return rows
+    sys.stderr.write(f"[enrich] fetching instructors/location for {len(rows)} classes...\n")
+
+    def one(r):
+        try:
+            d = gql(OP_DETAILS, _class_key_of(r), timeout=30).get("class") or {}
+        except Exception:
+            return
+        ps = d.get("primarySection") or {}
+        meets = ps.get("meetings") or []
+        if meets:
+            r["meetings"] = meets          # same shape, now with instructors + location
+        latest = ((ps.get("enrollment") or {}).get("latest") or {})
+        r["waitlistedCount"] = latest.get("waitlistedCount")
+        r["maxWaitlist"] = latest.get("maxWaitlist")
+
+    _thread_map(one, rows)
+    return rows
+
+
+# GE section-attribute values that are university requirements rather than L&S
+# breadths (catalogFilterOptions lists them under both, but only these belong in
+# univ_reqs): American Cultures, American History/Institutions, R&C, ELW.
+_UNIV_REQ_CODES = {"AC", "AH", "AI", "AHI", "RCA", "RCB", "ELW", "ELWR"}
+
+
+def enrich_requirements(rows, a):
+    """Refill breadths / university requirements, one call per distinct course."""
+    courses = sorted({(r["subject"], r["courseNumber"]) for r in rows})
+    if len(courses) > a.enrich_max:
+        sys.stderr.write(f"[enrich] {len(courses)} courses exceeds --enrich-max "
+                         f"{a.enrich_max}; breadths/univ_reqs will be blank.\n")
+        return rows
+    sys.stderr.write(f"[enrich] fetching requirements for {len(courses)} courses...\n")
+    found = {}
+
+    def one(key):
+        subject, number = key
+        try:
+            d = gql(OP_REQS, {"subject": subject, "number": number}, timeout=30)
+        except Exception:
+            return
+        mrc = ((d.get("course") or {}).get("mostRecentClass") or {})
+        breadths, univ = set(), set()
+        rd = mrc.get("requirementDesignation") or {}
+        if rd.get("description"):
+            univ.add(rd["description"])
+        for sa in ((mrc.get("primarySection") or {}).get("sectionAttributes") or []):
+            # only the GE attribute carries breadth / requirement designations;
+            # the rest are course level, instruction type, unit rules, notes.
+            if ((sa.get("attribute") or {}).get("code") or "") != "GE":
+                continue
+            val = sa.get("value") or {}
+            desc, code = val.get("description"), (val.get("code") or "").upper()
+            if not desc:
+                continue
+            (univ if code in _UNIV_REQ_CODES else breadths).add(desc)
+        found[key] = (breadths, univ)
+
+    _thread_map(one, courses)
+    for r in rows:
+        b, u = found.get((r["subject"], r["courseNumber"]), (set(), set()))
+        r["breadthRequirements"] = sorted(b)
+        r["universityRequirements"] = sorted(u)
+    return rows
 
 
 def consolidate(rows, a):
@@ -373,25 +458,32 @@ def output(items, a):
 def cmd_search(a):
     filters = build_filters(a)
     rows = fetch_all(a, filters)
+    wanted = {c.strip() for c in (a.fields or "").split(",") if c.strip()}
+    if rows and not a.no_enrich:
+        if a.instructor or (wanted & ENRICH_FIELDS):
+            enrich_rows(rows, a)
+        if wanted & COURSE_FIELDS:
+            enrich_requirements(rows, a)
     items = consolidate(rows, a)
     output(items, a)
 
 
 # --------------------------- filter-options -----------------------------------
 def cmd_filter_options(a):
-    # departments is an object list ([CatalogDepartment!]!) — request subfields.
-    q = """query($y:Int!,$s:Semester!){ catalogFilterOptions(year:$y,semester:$s){
-      levels breadthRequirements universityRequirements gradingOptions
-      departments { code name } } }"""
-    d = gql(q, {"y": a.year, "s": a.semester}).get("catalogFilterOptions") or {}
+    d = gql(OP_FILTERS, {"year": a.year, "semester": a.semester}).get("catalogFilterOptions") or {}
     for k in ("levels", "breadthRequirements", "universityRequirements", "gradingOptions"):
         v = d.get(k) or []
         print(f"\n{k} ({len(v)}):")
-        for x in v: print(f"  {x}")
-    depts = d.get("departments") or []
-    print(f"\ndepartments ({len(depts)}):")
-    for x in depts:
-        print(f"  {x.get('code','')}: {x.get('name','')}" if isinstance(x, dict) else f"  {x}")
+        for x in v:
+            print(f"  {x}")
+    tr = d.get("timeRange") or {}
+    if tr:
+        print(f"\ntimeRange: {tr.get('minStartTime')} .. {tr.get('maxEndTime')}")
+    # The app's filter-options document no longer selects departments, so the
+    # valid --departments values can't be listed. They are still accepted as a
+    # server-side filter; use subject codes seen in search results (e.g. COMPSCI).
+    print("\ndepartments: not exposed by the persisted filter-options document; "
+          "--departments still works, pass subject codes seen in search output.")
 
 
 # ------------------------------- grades ---------------------------------------
@@ -401,60 +493,50 @@ def class_key(a):
 
 
 def cmd_grades(a):
-    d = gql(GRADES_QUERY, class_key(a)).get("class") or {}
-    gd = ((d.get("course") or {}).get("gradeDistribution") or {})
-    print(f"average={gd.get('average')}  pnpPercentage={gd.get('pnpPercentage')}")
+    # Course-level distribution (the persisted class-level document carries no
+    # pnpPercentage; GetGradeDistribution does, keyed by courseId).
+    c = (gql(OP_COURSE_GRADES, {"subject": a.subject,
+                                "number": a.course_number}).get("course") or {})
+    gd = c.get("gradeDistribution") or {}
+    pnp = None
+    if c.get("courseId"):
+        g = gql(OP_GRADE_DIST, {"subject": a.subject, "courseId": c["courseId"],
+                                "year": None, "semester": None, "sessionId": None,
+                                "classNumber": None, "familyName": None,
+                                "givenName": None}).get("grade") or {}
+        pnp = g.get("pnpPercentage")
+        gd = g or gd
+    print(f"average={gd.get('average')}  pnpPercentage={pnp if pnp is not None else gd.get('pnpPercentage')}")
     for row in (gd.get("distribution") or []):
         print(f"  {row['letter']:>3}: {row['count']}")
 
 
 def cmd_details(a):
-    d = gql(DETAILS_QUERY, class_key(a)).get("class") or {}
+    d = gql(OP_DETAILS, class_key(a)).get("class") or {}
     print(json.dumps(d, indent=2))
 
 
-# ----------------------------- introspect (FALLBACK) --------------------------
-def cmd_introspect(a):
-    if a.root:
-        q = """{ __schema { queryType{ fields{ name args{ name }
-              type{ name kind ofType{ name kind } } } }
-              mutationType{ fields{ name } } } }"""
-        d = gql(q).get("__schema") or {}
-        print("=== Query fields ===")
-        for f in (d.get("queryType") or {}).get("fields") or []:
-            args = ",".join(x["name"] for x in f["args"])
-            print(f"  {f['name']}({args})")
-        mt = d.get("mutationType")
-        if mt:
-            print("\n=== Mutation fields ===")
-            for f in mt.get("fields") or []:
-                print(f"  {f['name']}")
+# ----------------------------- persisted ops ----------------------------------
+def cmd_ops(a):
+    man = persisted.load_manifest(refresh=a.refresh)
+    if a.show:
+        entry = man["ops"].get(a.show)
+        if not entry:
+            raise SystemExit(f"No persisted operation named {a.show!r}.")
+        print(f"# id: {entry['id']}\n")
+        print(entry["source"])
         return
-    name = a.type or a.enum
-    q = """query($n:String!){ __type(name:$n){ name kind description
-      enumValues{ name description }
-      inputFields{ name type{ name kind ofType{ name kind ofType{ name kind } } } }
-      fields{ name type{ name kind ofType{ name kind ofType{ name kind } } } } } }"""
-    t = gql(q, {"n": name}).get("__type")
-    if not t:
-        print(f"No such type: {name}"); return
-
-    def tn(ty):
-        s = ""
-        while ty:
-            if ty.get("kind") == "LIST": s = "[]" + s
-            if ty.get("name"): return ty["name"] + s
-            ty = ty.get("ofType")
-        return "?" + s
-    print(f"{t['kind']} {t['name']}" + (f" — {t['description']}" if t.get("description") else ""))
-    for f in t.get("enumValues") or []:
-        print(f"  = {f['name']}")
-    for f in t.get("inputFields") or []:
-        print(f"  input {f['name']}: {tn(f['type'])}")
-    for f in t.get("fields") or []:
-        print(f"  field {f['name']}: {tn(f['type'])}")
+    names = sorted(man["ops"])
+    if a.grep:
+        needle = a.grep.lower()
+        names = [n for n in names
+                 if needle in n.lower() or needle in man["ops"][n]["source"].lower()]
+    print(f"bundle {man['bundle']}  ({len(names)} operations)")
+    for n in names:
+        print("  " + n)
 
 
+# ----------------------------- introspect (FALLBACK) --------------------------
 # ------------------------- RateMyProfessors lookup -----------------------------
 # Minimal port of the professor-search idea from tisuela/ratemyprof-api: given a
 # name, find the matching professor and surface their rating + profile link. That
@@ -538,9 +620,8 @@ def cmd_rmp(a):
 
 # -------------------------------- raw -----------------------------------------
 def cmd_raw(a):
-    query = open(a.file).read() if a.file else a.query
-    variables = json.loads(a.vars) if a.vars else {}
-    print(json.dumps(gql(query, variables), indent=2))
+    variables = json.loads(a.vars) if a.vars else None
+    print(json.dumps(gql(a.op, variables), indent=2))
 
 
 def main():
@@ -583,6 +664,10 @@ def main():
     s.add_argument("--min-grade", type=float)
     s.add_argument("--instructor", help="filter to classes with an instructor name "
                    "matching this substring, case-insensitive (e.g. 'Hug')")
+    s.add_argument("--enrich-max", type=int, default=400,
+                   help="max classes/courses to enrich with per-class lookups (default 400)")
+    s.add_argument("--no-enrich", action="store_true",
+                   help="skip per-class enrichment (instructor/location/waitlist stay blank)")
     s.add_argument("--sort-local", help="re-sort locally by any output column "
                    "(grade, workload, difficulty, open, units, ...)")
     s.add_argument("--asc", action="store_true", help="ascending local sort")
@@ -605,15 +690,14 @@ def main():
     de = sub.add_parser("details", help="rich details for one class")
     class_args(de); de.set_defaults(func=cmd_details)
 
-    it = sub.add_parser("introspect", help="schema introspection FALLBACK")
-    it.add_argument("--root", action="store_true", help="list Query/Mutation fields")
-    it.add_argument("--type", help="describe an OBJECT/INPUT type")
-    it.add_argument("--enum", help="list an ENUM's values")
-    it.set_defaults(func=cmd_introspect)
+    op = sub.add_parser("ops", help="list/show the persisted operations the API accepts")
+    op.add_argument("--show", help="print one operation's id and full GraphQL source")
+    op.add_argument("--grep", help="filter the list by name or source text")
+    op.add_argument("--refresh", action="store_true", help="rebuild the manifest from the live site")
+    op.set_defaults(func=cmd_ops)
 
-    r = sub.add_parser("raw", help="run an arbitrary GraphQL query")
-    r.add_argument("--query", help="inline query string")
-    r.add_argument("--file", help="path to a .graphql file")
+    r = sub.add_parser("raw", help="run one persisted operation by name")
+    r.add_argument("--op", required=True, help="operation name (see: bt.py ops)")
     r.add_argument("--vars", help="JSON variables")
     r.set_defaults(func=cmd_raw)
 
